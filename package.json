@@ -20,8 +20,8 @@
     "clean": "rimraf lib"
   },
   "dependencies": {
-    "@zhin.js/ai": "^1.1.10",
-    "@zhin.js/core": "^1.1.10",
+    "@zhin.js/ai": "workspace:*",
+    "@zhin.js/core": "workspace:*",
     "js-yaml": "^4.1.0"
   },
   "devDependencies": {
