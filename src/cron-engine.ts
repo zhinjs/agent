@@ -50,6 +50,12 @@ export interface CronJobRecord {
   /** 执行时的上下文（缺省为 system/cron） */
   context?: CronJobContext;
   createdAt: number;
+  /** 上次执行时间戳 */
+  lastExecutedAt?: number;
+  /** 上次执行结果 */
+  lastStatus?: 'ok' | 'error';
+  /** 上次执行错误信息 */
+  lastError?: string;
 }
 
 export function getCronJobsFilePath(dataDir: string): string {
@@ -223,6 +229,19 @@ export class PersistentCronEngine {
     }
     this.disposes.clear();
   }
+
+  /**
+   * 更新任务的执行状态（由 runner 调用）
+   */
+  async updateJobStatus(id: string, status: 'ok' | 'error', error?: string): Promise<void> {
+    const jobs = await readCronJobsFile(this.options.dataDir);
+    const job = jobs.find((j) => j.id === id);
+    if (!job) return;
+    job.lastExecutedAt = Date.now();
+    job.lastStatus = status;
+    job.lastError = status === 'error' ? error : undefined;
+    await writeCronJobsFile(this.options.dataDir, jobs);
+  }
 }
 
 /**
@@ -284,6 +303,9 @@ export function createCronTools(options?: { optimizePrompt?: PromptOptimizer }):
             enabled: j.enabled,
             context: j.context,
             createdAt: j.createdAt,
+            lastExecutedAt: j.lastExecutedAt,
+            lastStatus: j.lastStatus,
+            lastError: j.lastError,
           }))
         : [];
       return { memory, persistent };

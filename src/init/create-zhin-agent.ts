@@ -10,6 +10,7 @@ import { createBuiltinTools } from '../builtin-tools.js';
 import { collectPluginSkillSearchRoots } from '../discovery-utils.js';
 import { resolveSkillInstructionMaxChars, DEFAULT_CONFIG } from '../zhin-agent/config.js';
 import { PersistentCronEngine, setCronManager } from '../cron-engine.js';
+import { createTaskExecutor } from '../task-executor.js';
 import type { AIServiceRefs } from './shared-refs.js';
 
 export function createZhinAgentContext(refs: AIServiceRefs): void {
@@ -77,9 +78,17 @@ export function createZhinAgentContext(refs: AIServiceRefs): void {
         };
       });
     });
+    // Unified task executor — single execution+delivery path for cron/scheduler/subagent
+    const resolveAdapter = (platform: string) => {
+      const adapter = root.inject(platform) as { sendMessage?: (opts: SendOptions) => Promise<string> } | undefined;
+      if (adapter && typeof adapter.sendMessage === 'function') return adapter as { sendMessage: (opts: SendOptions) => Promise<string> };
+      return undefined;
+    };
+    const executor = createTaskExecutor({ agent, resolveAdapter });
+
     agent.setSubagentSender(async (origin, content) => {
-      const adapter = root.inject(origin.platform) as { sendMessage?: (opts: SendOptions) => Promise<string> } | undefined;
-      if (!adapter || typeof adapter.sendMessage !== 'function') {
+      const adapter = resolveAdapter(origin.platform);
+      if (!adapter) {
         logger.warn(`[子任务] 找不到适配器: ${origin.platform}`);
         return;
       }
@@ -97,46 +106,15 @@ export function createZhinAgentContext(refs: AIServiceRefs): void {
     const cronFeature = root.inject('cron') as import('@zhin.js/core').CronFeature | undefined;
     if (cronFeature && typeof cronFeature.add === 'function') {
       const addCron: import('../cron-engine.js').AddCronFn = (c) => cronFeature.add(c, 'cron-engine');
-      const runner = async (prompt: string, _jobId: string, jobContext?: import('../cron-engine.js').CronJobContext) => {
+      const runner = async (prompt: string, jobId: string, jobContext?: import('../cron-engine.js').CronJobContext) => {
         if (!refs.zhinAgent) return;
-        // Enrich prompt with current time and execution context so AI
-        // produces the actual content instead of explaining a template.
-        const now = new Date();
-        const timeStr = now.toLocaleString('zh-CN', { hour12: false });
-        const weekdays = ['日', '一', '二', '三', '四', '五', '六'];
-        const weekday = weekdays[now.getDay()];
-        const enrichedPrompt = [
-          `[定时任务自动触发] 当前时间: ${timeStr} 星期${weekday}`,
-          `请直接生成以下任务要求的内容，不要解释模板或询问用户。回复将自动发送到聊天中。`,
-          `任务: ${prompt}`,
-        ].join('\n');
-        const elements = await refs.zhinAgent.process(enrichedPrompt, {
-          platform: jobContext?.platform || 'cron',
-          senderId: jobContext?.senderId || 'system',
-          botId: jobContext?.botId,
-          sceneId: jobContext?.sceneId || 'cron',
-          scope: (jobContext?.scope as any) || undefined,
+        const result = await executor.executeTask({
+          prompt,
+          context: jobContext || {},
+          timeContext: true,
         });
-        // Deliver AI response to the user's chat
-        const text = elements.map(el => {
-          if (el.type === 'text') return el.content || '';
-          if (el.type === 'image') return `<image url="${el.url}"/>`;
-          return '';
-        }).join('\n').trim();
-        if (text && jobContext?.platform && jobContext.botId && jobContext.sceneId) {
-          const adapter = root.inject(jobContext.platform) as { sendMessage?: (opts: SendOptions) => Promise<string> } | undefined;
-          if (adapter && typeof adapter.sendMessage === 'function') {
-            const sceneType = (jobContext.scope || 'private') as MessageType;
-            await adapter.sendMessage({
-              context: jobContext.platform,
-              bot: jobContext.botId,
-              id: jobContext.sceneId,
-              type: sceneType,
-              content: text,
-            });
-          } else {
-            logger.warn(`[Cron] 无法投递: 找不到适配器 ${jobContext.platform}`);
-          }
+        if (cronEngine) {
+          await cronEngine.updateJobStatus(jobId, result.success ? 'ok' : 'error', result.error);
         }
       };
       cronEngine = new PersistentCronEngine({ dataDir, addCron, runner });
@@ -150,10 +128,13 @@ export function createZhinAgentContext(refs: AIServiceRefs): void {
       workspace: process.cwd(),
       onJob: async (job) => {
         if (!refs.zhinAgent) return;
-        await refs.zhinAgent.process(job.payload.message, {
-          platform: 'cron',
-          senderId: 'system',
-          sceneId: 'scheduler',
+        await executor.executeTask({
+          prompt: job.payload.message,
+          context: {
+            platform: 'cron',
+            senderId: 'system',
+            sceneId: job.payload.target || 'scheduler',
+          },
         });
       },
     });
